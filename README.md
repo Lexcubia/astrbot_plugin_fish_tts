@@ -2,7 +2,7 @@
 
 > 短句开口说，长文发文字。直连 [Fish Audio](https://fish.audio)，支持 S2 情绪标签，发文字时自动去标签。
 
-- 🐟 **直连 Fish**：插件自己调用 Fish API，可走自建 Cloudflare Worker 反代，不依赖 AstrBot 的 TTS 设置
+- 🐟 **直连 Fish**：插件自己调用 Fish API，可走自定义地址，不依赖 AstrBot 的 TTS 设置
 - 🎭 **情绪标签**：`[happy]`、`[whispering]`、`[laughing]` 转语音时交给 Fish，发文字时自动去掉
 - ✂️ **长短分流**：短回复转语音，长回复发文字；链接、代码块、Emoji、@ 自动过滤
 - 🧠 **语音记忆**：记下每条语音说了什么，别人引用这条语音时告诉大模型
