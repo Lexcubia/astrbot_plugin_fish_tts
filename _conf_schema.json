@@ -80,10 +80,10 @@
         "hint": "直连就用默认值；走自建的 Cloudflare Worker 反代就填 Worker 的地址（例如 https://xxx.workers.dev）。带不带 /v1 都行，插件会补全成 /v1/tts。"
       },
       "reference_id": {
-        "description": "音色 ID（reference_id）",
+        "description": "默认音色 ID（reference_id）",
         "type": "string",
         "default": "",
-        "hint": "Fish 音色库里某个音色页面地址末尾的那串 ID。留空则使用 Fish 的默认音色。"
+        "hint": "音色库里没有选中任何音色时用这个。想存多个音色、写备注、试听、随时切换：到本插件的「音色库」页面（插件详情页里打开），或在聊天里发 /fish音色 列表。ID 是 Fish 音色页面地址末尾那串字符；留空则使用 Fish 的默认音色。"
       },
       "model": {
         "description": "模型",

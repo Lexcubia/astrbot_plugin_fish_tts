@@ -1,8 +1,9 @@
 name: astrbot_plugin_fish_tts
 display_name: Fish TTS优化
-short_desc: Fish Audio 语音优化：短句转语音、长文发文字，支持 S2 情绪标签。
-desc: Fish TTS优化：直连 Fish Audio（可走自建反代），短句开口说、长文发文字；支持 S2 情绪标签 [happy] [whispering]，发文字时自动去标签；另带语音记忆，让大模型知道自己发过什么语音、被引用的是哪一句。
-version: 3.2.0
+short_desc: Fish Audio 语音优化：短句转语音、长文发文字，支持 S2 情绪标签、多音色保存切换，插件页面可管理和试听音色。
+desc: Fish TTS优化：直连 Fish Audio（可走自建反代），短句开口说、长文发文字；支持 S2 情绪标签 [happy] [whispering]，发文字时自动去标签；可保存多个带备注的音色 ID 并随时切换，插件页面里能管理、试听；另带语音记忆，让大模型知道自己发过什么语音、被引用的是哪一句。
+version: 3.4.0
+astrbot_version: ">=4.26.0"
 author: zhouinzhe
 repo: https://github.com/zhouinzhe/astrbot_plugin_fish_tts
 tags:

@@ -1,26 +1,36 @@
 import asyncio
+import base64
+import contextlib
 import json
 import random
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import astrbot.api.message_components as Comp
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
+from astrbot.api.web import error_response, json_response
+from astrbot.api.web import request as web_request
+from astrbot.core.agent.message import TextPart
+from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 try:
     from . import emotion
     from .fish_client import DEFAULT_BASE, FishConfig, FishTTS
+    from .voice_library import MAX_VOICES, VoiceLibrary, VoiceLibraryError, parse_voice_id
     from .voice_memory import VoiceMemory
 except ImportError:  # 不是以包的方式加载时的兜底
     import emotion
     from fish_client import DEFAULT_BASE, FishConfig, FishTTS
+    from voice_library import MAX_VOICES, VoiceLibrary, VoiceLibraryError, parse_voice_id
     from voice_memory import VoiceMemory
 
 _PLUGIN_NAME = "astrbot_plugin_fish_tts"
+_TEST_TEXT = "你好，这是一条试听语音。"  # 网页里试听时没写文字就用这句
+_TEST_MAX_CHARS = 200  # 试听文字上限：Fish 按字数计费，别一不小心合成一大段
 
 _CODE_FENCE = re.compile(r"```.*?```", re.DOTALL)
 _MD_IMAGE = re.compile(r"!\[[^\]]*\]\(\s*<?([^)\s>]*)>?[^)]*\)")
@@ -46,16 +56,15 @@ _AT_TEXT = re.compile(
     re.IGNORECASE,
 )
 
-# 消息链里真正的 @ 组件（At / AtAll）。用 getattr 兼容不同版本。
-_AT_TYPES = tuple(t for t in (getattr(Comp, "At", None), getattr(Comp, "AtAll", None)) if t)
+# 消息链里真正的 @ 组件（At / AtAll）
+_AT_TYPES = (Comp.At, Comp.AtAll)
 # 重排消息链时要留在最前面的组件：引用 + @
-_HEAD_TYPES = tuple(t for t in (getattr(Comp, "Reply", None), *_AT_TYPES) if t)
-_REPLY_TYPE = getattr(Comp, "Reply", None)
+_HEAD_TYPES = (Comp.Reply, *_AT_TYPES)
 
 # 同一次对话（同一个事件）里的去重：agent 先说一句话再调工具（如选表情），
 # 工具跑完后又把同一句话说一遍，两条回复各走一遍发送前钩子，就会转出两条语音。
-_STATE_KEY = "_tts_by_length_state"  # 事件上记录“已转过语音的文本”
-_CLAIM_ATTR = "_tts_by_length_claimed"  # 结果对象上的“已有人在处理”标记，防止并发重复合成
+_STATE_KEY = "_fish_tts_state"  # 事件上记录“已转过语音的文本”
+_CLAIM_ATTR = "_fish_tts_claimed"  # 结果对象上的“已有人在处理”标记，防止并发重复合成
 _NON_WORD = re.compile(r"[\W_]+")  # 比较内容是否相同时，忽略标点和空白
 
 # ---------- 语音记忆（v2.0） ----------
@@ -80,60 +89,6 @@ _NOTE_QUOTE_UNKNOWN = (
 )
 _NOTE_QUOTE_TEXT = "（系统补充：用户这条消息引用的是你之前发出的这句话：「{text}」）"
 
-# v3.0 及以前的设置是平铺的；v3.1 起按分组存放。旧键 -> (分组, 新键)，用来把旧值搬到新位置。
-_LEGACY = {
-    "enabled": ("basic", "enabled"),
-    "max_chars": ("basic", "max_chars"),
-    "min_chars": ("basic", "min_chars"),
-    "trigger_probability": ("basic", "trigger_probability"),
-    "tts_timeout": ("basic", "tts_timeout"),
-    "only_llm_result": ("basic", "only_llm_result"),
-    "skip_platforms": ("basic", "skip_platforms"),
-    "tts_backend": ("fish", "backend"),
-    "fish_api_key": ("fish", "api_key"),
-    "fish_api_base": ("fish", "api_base"),
-    "fish_reference_id": ("fish", "reference_id"),
-    "fish_model": ("fish", "model"),
-    "fish_format": ("fish", "format"),
-    "fish_speed": ("fish_advanced", "speed"),
-    "fish_volume": ("fish_advanced", "volume"),
-    "fish_temperature": ("fish_advanced", "temperature"),
-    "fish_top_p": ("fish_advanced", "top_p"),
-    "fish_latency": ("fish_advanced", "latency"),
-    "fish_normalize": ("fish_advanced", "normalize"),
-    "fish_retries": ("fish_advanced", "retries"),
-    "fish_extra_body": ("fish_advanced", "extra_body"),
-    "emotion_tags": ("emotion", "enabled"),
-    "inject_emotion_prompt": ("emotion", "inject_prompt"),
-    "strip_tags_in_text": ("emotion", "strip_in_text"),
-    "emotion_max_tags": ("emotion", "max_tags"),
-    "emotion_tag_mode": ("emotion", "tag_mode"),
-    "emotion_extra_tags": ("emotion", "extra_tags"),
-    "emotion_prompt": ("emotion", "prompt"),
-    "filter_url": ("reading", "filter_url"),
-    "url_action": ("reading", "url_action"),
-    "skip_if_code": ("reading", "skip_if_code"),
-    "skip_if_at": ("reading", "skip_if_at"),
-    "strip_at_text": ("reading", "strip_at_text"),
-    "strip_emoji": ("reading", "strip_emoji"),
-    "cleanup_markdown": ("reading", "cleanup_markdown"),
-    "custom_filter_patterns": ("reading", "custom_filter_patterns"),
-    "keep_text": ("reading", "keep_text"),
-    "dedupe_same_event": ("reading", "dedupe_same_event"),
-    "voice_memory": ("memory", "enabled"),
-    "memory_persist": ("memory", "persist"),
-    "memory_size": ("memory", "size"),
-    "memory_keep_hours": ("memory", "keep_hours"),
-    "inject_quote": ("memory", "inject_quote"),
-    "match_tolerance": ("memory", "match_tolerance"),
-    "recent_mode": ("memory", "recent_mode"),
-    "recent_count": ("memory", "recent_count"),
-    "recent_minutes": ("memory", "recent_minutes"),
-    "recent_keywords": ("memory", "recent_keywords"),
-    "quote_note_template": ("memory", "quote_note"),
-    "recent_note_template": ("memory", "recent_note"),
-}
-
 # ---------- Fish Audio（v3.0） ----------
 _BACKENDS = ("fish", "astrbot")
 _DEFAULT_MODEL = "s2.1-pro"
@@ -151,9 +106,9 @@ def _as_bool(value, default: bool) -> bool:
     return default if value is None else bool(value)
 
 
-def _as_int(value, default: int, lo=None, hi=None) -> int:
+def _as_number(value, default, cast, lo=None, hi=None):
     try:
-        result = int(value)
+        result = cast(value)
     except (TypeError, ValueError):
         result = default
     if lo is not None:
@@ -161,18 +116,14 @@ def _as_int(value, default: int, lo=None, hi=None) -> int:
     if hi is not None:
         result = min(hi, result)
     return result
+
+
+def _as_int(value, default: int, lo=None, hi=None) -> int:
+    return _as_number(value, default, int, lo, hi)
 
 
 def _as_float(value, default: float, lo=None, hi=None) -> float:
-    try:
-        result = float(value)
-    except (TypeError, ValueError):
-        result = default
-    if lo is not None:
-        result = max(lo, result)
-    if hi is not None:
-        result = min(hi, result)
-    return result
+    return _as_number(value, default, float, lo, hi)
 
 
 def _as_str(value, default: str) -> str:
@@ -183,7 +134,7 @@ def _as_str(value, default: str) -> str:
 def _as_list(value) -> tuple:
     if not isinstance(value, (list, tuple)):
         return ()
-    return tuple(str(v) for v in value if str(v))
+    return tuple(text for text in map(str, value) if text)
 
 
 @dataclass(frozen=True)
@@ -324,7 +275,7 @@ def _chat_key(event: AstrMessageEvent) -> str:
     不直接用 unified_msg_origin：开了「群聊会话隔离」后它会带上发言人，
     A 触发的语音被 B 引用时就查不到了。
     """
-    platform = _call_str(event, "get_platform_id") or _call_str(event, "get_platform_name")
+    platform = _call_str(event, "get_platform_id")
     group = _call_str(event, "get_group_id")
     if group:
         return f"{platform}:g:{group}"
@@ -341,13 +292,7 @@ def _plain_text(chain) -> str:
 
 
 def _first_reply(event: AstrMessageEvent):
-    if _REPLY_TYPE is None:
-        return None
-    message = getattr(getattr(event, "message_obj", None), "message", None) or []
-    for comp in message:
-        if isinstance(comp, _REPLY_TYPE):
-            return comp
-    return None
+    return next((comp for comp in event.message_obj.message or [] if isinstance(comp, Comp.Reply)), None)
 
 
 def _shorten(text: str, limit: int = 300) -> str:
@@ -380,24 +325,26 @@ def _request_contains(req, snippet: str) -> bool:
     key = _SPACES.sub("", snippet)[:24]
     if not key:
         return False
-    texts = [getattr(req, "prompt", None), getattr(req, "system_prompt", None)]
-    for part in getattr(req, "extra_user_content_parts", None) or []:
-        texts.append(getattr(part, "text", None))
+    texts = [req.prompt, req.system_prompt, *(getattr(part, "text", None) for part in req.extra_user_content_parts)]
     return any(key in _SPACES.sub("", t) for t in texts if isinstance(t, str))
 
 
-def _append_prompt(req, note: str) -> None:
-    prompt = getattr(req, "prompt", None) or ""
-    if note in prompt:
-        return
-    req.prompt = f"{prompt.rstrip()}\n\n{note}" if prompt.strip() else note
-
-
 def _append_system(req, note: str) -> None:
-    system = getattr(req, "system_prompt", None) or ""
+    system = req.system_prompt or ""
     if note in system:
         return
     req.system_prompt = f"{system.rstrip()}\n\n{note}" if system.strip() else note
+
+
+def _add_note(req, note: str) -> None:
+    """把说明作为「临时内容块」追加到本轮请求的用户消息后面。
+
+    临时块只参与这一次请求，不写进对话历史；系统提示词和历史消息保持不变，提示词缓存才能命中。
+    """
+    parts = req.extra_user_content_parts
+    if any(getattr(part, "text", None) == note for part in parts):
+        return  # 同一条说明已经加过了
+    parts.append(TextPart(text=note).mark_as_temp())
 
 
 async def _get_msg(event: AstrMessageEvent, message_id: str) -> "_Quoted | None":
@@ -430,24 +377,10 @@ async def _get_msg(event: AstrMessageEvent, message_id: str) -> "_Quoted | None"
 
 def _resolve_data_dir() -> Path:
     """插件数据目录：放在 data/plugin_data 下，更新、重装插件都不会丢。"""
-    try:
-        from astrbot.api.star import StarTools
-
-        try:
-            return Path(StarTools.get_data_dir())
-        except Exception:  # noqa: BLE001
-            return Path(StarTools.get_data_dir(_PLUGIN_NAME))
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        from astrbot.core.utils.astrbot_path import get_astrbot_data_path
-
-        return Path(get_astrbot_data_path()) / "plugin_data" / _PLUGIN_NAME
-    except Exception:  # noqa: BLE001
-        return Path("data") / "plugin_data" / _PLUGIN_NAME
+    return Path(get_astrbot_data_path()) / "plugin_data" / _PLUGIN_NAME
 
 
-class TTSLengthGate(Star):
+class FishTTSPlugin(Star):
     """按回复长度决定是否转语音：短文本走 TTS，长文本直接发文字。
 
     在 on_decorating_result（消息发送前）判断长度，自己调用当前会话的 TTS Provider。
@@ -458,12 +391,13 @@ class TTSLengthGate(Star):
     v3.0 起针对 Fish Audio 优化：直接调用 Fish API（可走自建反代），支持 S2 情绪标签
     （[happy]、[whispering] 这类方括号），发文字时自动去掉标签，长度和语音记忆都按去掉标签后的文本算。
     v3.1 起设置按分组显示，展示名改为「Fish TTS优化」；v3.2 起插件标识改为 astrbot_plugin_fish_tts。
+    v3.3 起带「音色库」：用指令保存多个音色 ID、随时切换；语音上下文改用临时内容块注入。
+    v3.4 起音色带备注，插件页面里可以管理音色、试听；要求 AstrBot 4.26.0 及以上。
     """
 
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
-        self._migrate_legacy()
         self._pat_raw: tuple = ()
         self._pat_compiled: tuple = ()
         self._bad_patterns: set = set()
@@ -471,17 +405,29 @@ class TTSLengthGate(Star):
         self._extra_raw = None  # 「额外请求参数」的原文和解析结果，没改过就不重复解析
         self._extra_val: dict = {}
         self._warned: set = set()  # 只提醒一次的配置问题，避免群聊里刷屏
+        self._test_lock = asyncio.Lock()  # 网页试听一次只跑一条
 
-        path = None
-        out_dir = None
+        path = lib_path = out_dir = None
         try:
             data_dir = _resolve_data_dir()
             path = data_dir / "voice_memory.json"
+            lib_path = data_dir / "voice_library.json"
             out_dir = data_dir / "tts_cache"
         except Exception as exc:  # noqa: BLE001
-            logger.warning(f"[fish_tts] 无法确定数据目录，语音记忆不落盘、Fish 语音无法保存: {exc}")
+            logger.warning(f"[fish_tts] 无法确定数据目录，语音记忆、音色库不落盘，Fish 语音无法保存: {exc}")
         self.memory = VoiceMemory(path)
+        self.voices = VoiceLibrary(lib_path)  # 必须在 _settings() 之前：当前音色从这里取
         self._fish = FishTTS(out_dir)
+        try:
+            count = self.voices.load()
+            if count:
+                logger.info(f"[fish_tts] 已读回 {count} 个音色")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[fish_tts] 读取音色库失败，从空白开始: {exc}")
+        try:
+            self._register_web_api(context)
+        except Exception as exc:  # noqa: BLE001  网页注册失败不能影响语音功能
+            logger.warning(f"[fish_tts] 注册插件页面接口失败（语音功能不受影响）: {exc}")
         cfg = self._settings()
         if cfg.memory and cfg.memory_persist:
             try:
@@ -535,38 +481,12 @@ class TTSLengthGate(Star):
         value = self.config.get(name)
         return value if isinstance(value, dict) else {}
 
-    def _migrate_legacy(self) -> None:
-        """旧版（v3.0 及以前）设置是平铺的。AstrBot 如果还留着旧键，就把旧值搬进新的分组，并保存。"""
-        moved = 0
-        for old, (group, key) in _LEGACY.items():
-            try:
-                if old not in self.config:
-                    continue
-                target = self.config.get(group)
-                if not isinstance(target, dict):
-                    target = {}
-                    self.config[group] = target
-                target[key] = self.config[old]
-                del self.config[old]
-                moved += 1
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(f"[fish_tts] 迁移旧设置「{old}」失败（已忽略）: {exc}")
-        if not moved:
-            return
-        save = getattr(self.config, "save_config", None)
-        if callable(save):
-            try:
-                save()
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(f"[fish_tts] 保存迁移后的设置失败（已忽略）: {exc}")
-        logger.info(f"[fish_tts] 已把 {moved} 项旧版设置迁移到新的分组设置")
-
     def _fish_config(self, timeout: float) -> FishConfig:
         f, a = self._group("fish"), self._group("fish_advanced")
         return FishConfig(
             api_key=_as_str(f.get("api_key"), ""),
             api_base=_as_str(f.get("api_base"), DEFAULT_BASE),
-            reference_id=_as_str(f.get("reference_id"), ""),
+            reference_id=self.voices.active_id or _as_str(f.get("reference_id"), ""),
             model=_as_str(f.get("model"), _DEFAULT_MODEL),
             format=_as_str(f.get("format"), "mp3"),
             temperature=_as_float(a.get("temperature"), 0.0, lo=0.0, hi=1.0),
@@ -657,11 +577,7 @@ class TTSLengthGate(Star):
         """沿用 AstrBot 当前会话的 TTS 提供商（语音合成方式选 astrbot）。"""
         umo = event.unified_msg_origin
         try:
-            getter = getattr(self.context, "get_using_tts_provider_async", None)
-            if getter is not None:
-                provider = await getter(umo=umo)
-            else:  # 旧版本
-                provider = self.context.get_using_tts_provider(umo)
+            provider = await self.context.get_using_tts_provider_async(umo=umo)
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"[fish_tts] 获取 TTS Provider 失败: {exc}")
             return None
@@ -680,29 +596,224 @@ class TTSLengthGate(Star):
             logger.warning(f"[fish_tts] TTS 合成失败，保持文字: {exc}")
             return None
 
+    # ---------- 音色库指令 ----------
+    @filter.command_group("fish音色")
+    def voice_group(self):
+        """Fish 音色库：保存多个音色 ID，随时切换。"""
+
+    @voice_group.command("列表")
+    async def voice_list(self, event: AstrMessageEvent):
+        """看已保存的音色，▶ 是当前在用的。"""
+        yield event.plain_result(self._voice_overview())
+
+    @voice_group.command("添加")
+    async def voice_add(self, event: AstrMessageEvent, name: str = "", voice: str = "", note: str = ""):
+        """添加或覆盖一个音色：/fish音色 添加 名称 音色ID [备注]。备注不能有空格，长备注请到插件页面里写。"""
+
+        def action() -> str:
+            if not name or not voice:
+                raise VoiceLibraryError("用法：/fish音色 添加 名称 音色ID [备注]（也可以直接贴音色页面地址）")
+            saved, replaced = self.voices.add(name, voice, note or None)
+            tail = "（正在使用，已生效）" if saved == self.voices.active_name else f"，发送「/fish音色 切换 {saved}」启用"
+            return f"{'已更新' if replaced else '已保存'}「{saved}」{tail}"
+
+        yield event.plain_result(await self._voice_edit(event, action))
+
+    @voice_group.command("切换")
+    async def voice_use(self, event: AstrMessageEvent, key: str = ""):
+        """切换音色：/fish音色 切换 名称（或列表里的序号）。"""
+
+        def action() -> str:
+            if not key:
+                raise VoiceLibraryError("用法：/fish音色 切换 名称（或列表里的序号）")
+            return f"已切换到「{self.voices.use(key)}」，下一条语音起生效"
+
+        yield event.plain_result(await self._voice_edit(event, action))
+
+    @voice_group.command("删除")
+    async def voice_remove(self, event: AstrMessageEvent, key: str = ""):
+        """删除音色：/fish音色 删除 名称（或列表里的序号）。"""
+
+        def action() -> str:
+            if not key:
+                raise VoiceLibraryError("用法：/fish音色 删除 名称（或列表里的序号）")
+            return self._remove_voice(key)
+
+        yield event.plain_result(await self._voice_edit(event, action))
+
+    @voice_group.command("默认")
+    async def voice_default(self, event: AstrMessageEvent):
+        """不用音色库里的音色，改回设置页里的默认音色。"""
+        yield event.plain_result(await self._voice_edit(event, self._clear_voice))
+
+    async def _voice_edit(self, event: AstrMessageEvent, action) -> str:
+        """聊天里改音色库只让管理员做。"""
+        if not event.is_admin():
+            return "只有管理员可以修改音色库"
+        try:
+            return await self._voice_apply(action)
+        except VoiceLibraryError as exc:
+            return str(exc)
+
+    async def _voice_apply(self, action) -> str:
+        """在内存里改音色库（action 返回提示语），再落盘。输入有问题时 action 抛 VoiceLibraryError。"""
+        message = action()
+        try:
+            await asyncio.to_thread(self.voices.save)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[fish_tts] 保存音色库失败: {exc}")
+            return f"{message}\n⚠️ 但没能写入磁盘，重启后会丢失：{exc}"
+        return message
+
+    def _remove_voice(self, key) -> str:
+        was_active = self.voices.active_name
+        name = self.voices.remove(key)
+        return f"已删除「{name}」" + ("，它是当前音色，已改回默认音色" if name == was_active else "")
+
+    def _clear_voice(self) -> str:
+        self.voices.clear_active()
+        return "已改回默认音色（设置页里的音色 ID；没填就是 Fish 默认音色）"
+
+    def _voice_overview(self) -> str:
+        fish = self._group("fish")
+        notes = []
+        if _as_str(fish.get("backend"), "fish") != "fish":
+            notes.append("⚠️ 语音合成方式不是 fish，音色库暂时不生效")
+        items = self.voices.items()
+        if not items:
+            notes.append("音色库还是空的。发送「/fish音色 添加 名称 音色ID」保存一个，也可以到插件页面里管理")
+            return "\n".join(notes)
+        active = self.voices.active_name
+        lines = [
+            f"{'▶' if name == active else '　'} {index}. {name}{f'（{voice.note}）' if voice.note else ''}\n　　{voice.id}"
+            for index, (name, voice) in enumerate(items, 1)
+        ]
+        if active:
+            footer = f"当前：{active}"
+        else:
+            footer = "当前没选音色库里的音色，用的是" + ("设置页里的默认音色 ID" if _as_str(fish.get("reference_id"), "") else "Fish 默认音色")
+        return "\n".join(["🐟 Fish 音色库", *lines, footer, "切换：/fish音色 切换 名称或序号", *notes])
+
+    # ---------- 插件页面（WebUI）接口 ----------
+    def _register_web_api(self, context: Context) -> None:
+        """给插件页面（pages/voices）用的后端接口。进得了 Dashboard 的人就是管理员，这里不再单独判断权限。"""
+        routes = (
+            ("voices", self.web_voices, "GET", "音色库：列表和当前状态"),
+            ("voices/save", self.web_voice_save, "POST", "音色库：添加或修改音色（名称、音色 ID、备注）"),
+            ("voices/use", self.web_voice_use, "POST", "音色库：切换音色"),
+            ("voices/remove", self.web_voice_remove, "POST", "音色库：删除音色"),
+            ("voices/default", self.web_voice_default, "POST", "音色库：改回默认音色"),
+            ("voices/test", self.web_voice_test, "POST", "音色库：试听（合成一小段语音）"),
+        )
+        for path, handler, method, desc in routes:
+            context.register_web_api(f"/{_PLUGIN_NAME}/{path}", handler, [method], desc)
+
+    def _voice_state(self) -> dict:
+        cfg = self._settings()
+        active = self.voices.active_name
+        return {
+            "voices": [
+                {"name": name, "id": voice.id, "note": voice.note, "active": name == active}
+                for name, voice in self.voices.items()
+            ],
+            "active": active,
+            "default_id": _as_str(self._group("fish").get("reference_id"), ""),
+            "backend": cfg.backend,
+            "has_key": bool(cfg.fish.api_key),
+            "max_voices": MAX_VOICES,
+            "test_max_chars": _TEST_MAX_CHARS,
+        }
+
+    async def _web_edit(self, action):
+        try:
+            message = await self._voice_apply(action)
+        except VoiceLibraryError as exc:
+            return error_response(str(exc), status_code=400)
+        return json_response({"message": message, **self._voice_state()})
+
+    @staticmethod
+    async def _web_body() -> dict:
+        body = await web_request.json(default={})
+        return body if isinstance(body, dict) else {}
+
+    async def web_voices(self):
+        return json_response(self._voice_state())
+
+    async def web_voice_save(self):
+        body = await self._web_body()
+
+        def action() -> str:
+            saved, replaced = self.voices.add(body.get("name"), body.get("id"), body.get("note"))
+            return f"{'已更新' if replaced else '已保存'}「{saved}」"
+
+        return await self._web_edit(action)
+
+    async def web_voice_use(self):
+        body = await self._web_body()
+        return await self._web_edit(lambda: f"已切换到「{self.voices.use(body.get('name'))}」，下一条语音起生效")
+
+    async def web_voice_remove(self):
+        body = await self._web_body()
+        return await self._web_edit(lambda: self._remove_voice(body.get("name")))
+
+    async def web_voice_default(self):
+        return await self._web_edit(self._clear_voice)
+
+    async def web_voice_test(self):
+        """试听：合成一小段语音，以 base64 返回给页面播放。可以试音色库里的音色（name）、还没保存的 ID（id），或当前在用的音色。"""
+        body = await self._web_body()
+        text = " ".join(str(body.get("text") or "").split()) or _TEST_TEXT
+        if len(text) > _TEST_MAX_CHARS:
+            return error_response(f"试听文字太长了（最多 {_TEST_MAX_CHARS} 个字）", status_code=400)
+        cfg = self._settings()
+        if not cfg.fish.api_key:
+            return error_response("还没有填写 Fish API Key（插件设置 → Fish 语音合成）", status_code=400)
+        try:
+            if body.get("name"):
+                label, voice = self.voices.get(body["name"])
+                reference_id = voice.id
+            elif body.get("id"):
+                reference_id = parse_voice_id(body["id"])
+                label = f"{reference_id[:8]}…"
+            else:
+                reference_id = cfg.fish.reference_id
+                label = self.voices.active_name or "当前音色"
+        except VoiceLibraryError as exc:
+            return error_response(str(exc), status_code=400)
+        if self._test_lock.locked():
+            return error_response("上一条试听还没完成，稍等一下再点", status_code=429)
+
+        async with self._test_lock:
+            started = time.monotonic()
+            try:
+                # 试听固定用 mp3：浏览器都能播，不受设置页里「音频格式」的影响
+                call = self._fish.synthesize(text, replace(cfg.fish, reference_id=reference_id, format="mp3"))
+                path = await (asyncio.wait_for(call, cfg.tts_timeout) if cfg.tts_timeout > 0 else call)
+                audio = await asyncio.to_thread(path.read_bytes)
+                with contextlib.suppress(OSError):
+                    path.unlink()  # 试听的文件用完就删，不留在缓存目录里
+            except asyncio.TimeoutError:
+                return error_response(f"超过 {cfg.tts_timeout:g} 秒没有返回", status_code=504)
+            except Exception as exc:  # noqa: BLE001  含 FishError
+                logger.warning(f"[fish_tts] 网页试听失败: {exc}")
+                return error_response(f"合成失败：{exc}", status_code=502)
+        return json_response(
+            {
+                "audio": base64.b64encode(audio).decode("ascii"),
+                "mime": "audio/mpeg",
+                "voice": label,
+                "seconds": round(time.monotonic() - started, 1),
+            }
+        )
+
     # ---------- 同一次对话去重 ----------
     @staticmethod
     def _voiced_texts(event: AstrMessageEvent) -> list:
         """这个事件里已经转过语音的文本（存在事件的 extra 上，随事件结束消失）。"""
-        state = None
-        getter = getattr(event, "get_extra", None)
-        if callable(getter):
-            try:
-                state = getter(_STATE_KEY)
-            except Exception:  # noqa: BLE001
-                state = None
-        if state is None:
-            state = getattr(event, _STATE_KEY, None)
+        state = event.get_extra(_STATE_KEY)
         if not isinstance(state, list):
             state = []
-            setter = getattr(event, "set_extra", None)
-            try:
-                if callable(setter):
-                    setter(_STATE_KEY, state)
-                else:
-                    setattr(event, _STATE_KEY, state)
-            except Exception:  # noqa: BLE001
-                pass
+            event.set_extra(_STATE_KEY, state)
         return state
 
     @staticmethod
@@ -712,14 +823,7 @@ class TTSLengthGate(Star):
         if any(not isinstance(c, _HEAD_TYPES) for c in kept):
             result.chain = kept
             return
-        try:
-            clear = getattr(event, "clear_result", None)
-            if callable(clear):
-                clear()
-            else:
-                result.chain = []
-        except Exception:  # noqa: BLE001
-            result.chain = []
+        event.clear_result()
 
     # ---------- 判断：这条回复要不要转语音 ----------
     @staticmethod
@@ -787,10 +891,8 @@ class TTSLengthGate(Star):
         if result is None or not result.chain:
             return
 
-        if cfg.only_llm:
-            is_llm = getattr(result, "is_llm_result", None)
-            if callable(is_llm) and not is_llm():
-                return
+        if cfg.only_llm and not result.is_llm_result():
+            return
 
         voiced = False
         try:
@@ -822,10 +924,8 @@ class TTSLengthGate(Star):
             return False
 
         # 先占位再合成：合成要几秒，这期间进来的重复调用能看到标记
-        try:
+        with contextlib.suppress(Exception):
             setattr(result, _CLAIM_ATTR, True)
-        except Exception:  # noqa: BLE001
-            pass
         if voiced is not None:
             voiced.append(key)
 
@@ -875,11 +975,7 @@ class TTSLengthGate(Star):
             if kept:
                 result.chain = kept
                 return
-            clear = getattr(event, "clear_result", None)  # 整条消息只有标签：没东西可发
-            if callable(clear):
-                clear()
-            else:
-                result.chain = []
+            event.clear_result()  # 整条消息只有标签：没东西可发
         except Exception as exc:  # noqa: BLE001  去标签出任何问题都不能影响消息发送
             logger.warning(f"[fish_tts] 去除情绪标签失败（已忽略）: {exc}")
 
@@ -957,18 +1053,16 @@ class TTSLengthGate(Star):
 
         note = await self._quote_note(event, req, chat, cfg) if cfg.inject_quote else None
         if note:
-            _append_prompt(req, note)
+            _add_note(req, note)
             return  # 已经说清楚引用的是哪条，不再重复补「最近语音」
 
         if cfg.recent_mode == "off":
             return
-        if cfg.recent_mode == "keywords" and not _mentions(
-            getattr(event, "message_str", "") or "", cfg.recent_keywords
-        ):
+        if cfg.recent_mode == "keywords" and not _mentions(event.message_str or "", cfg.recent_keywords):
             return
         records = self.memory.recent(chat, cfg.recent_count, cfg.recent_minutes * 60)
         if records:
-            _append_system(req, cfg.recent_note.replace("{list}", _fmt_list(records)))
+            _add_note(req, cfg.recent_note.replace("{list}", _fmt_list(records)))
 
     async def _quote_note(self, event: AstrMessageEvent, req, chat: str, cfg: Settings) -> "str | None":
         """用户引用了机器人自己的消息时，返回要补给大模型的说明；其他情况返回 None。"""

@@ -6,6 +6,7 @@
 3. 找不到或拿不准时老实说拿不准，绝不乱猜。
 """
 
+import contextlib
 import json
 import os
 import re
@@ -164,10 +165,8 @@ class VoiceMemory:
                 if records:
                     loaded[str(chat)] = records
         except Exception:  # noqa: BLE001
-            try:
+            with contextlib.suppress(OSError):
                 os.replace(self.path, self.path.with_name(self.path.name + ".bad"))
-            except OSError:
-                pass
             return 0
         self._chats = loaded
         return sum(len(v) for v in loaded.values())

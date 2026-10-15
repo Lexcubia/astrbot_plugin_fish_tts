@@ -36,7 +36,7 @@ _SEEN = (
 # 文档里的强度修饰：[slightly sad] [very excited] [extremely angry]
 _MODIFIERS = ("slightly", "very", "extremely", "a bit", "somewhat")
 
-KNOWN_TAGS = frozenset(_BASIC + _ADVANCED + list(_TONES) + list(_EFFECTS) + list(_SPECIAL) + list(_SEEN))
+KNOWN_TAGS = frozenset((*_BASIC, *_ADVANCED, *_TONES, *_EFFECTS, *_SPECIAL, *_SEEN))
 
 MODES = ("any", "whitelist")
 
@@ -79,12 +79,10 @@ def is_tag(inner: str, rules: EmotionRules) -> bool:
         return False
     if rules.mode != "whitelist":
         return True
-    if low in KNOWN_TAGS or low in rules.extra:
+    known = KNOWN_TAGS | rules.extra  # 只算一次，别在循环里反复合并
+    if low in known:
         return True
-    for mod in _MODIFIERS:
-        if low.startswith(mod + " ") and low[len(mod) + 1 :] in KNOWN_TAGS | rules.extra:
-            return True
-    return False
+    return any(low.startswith(mod + " ") and low[len(mod) + 1 :] in known for mod in _MODIFIERS)
 
 
 def _tags(text: str, rules: EmotionRules):

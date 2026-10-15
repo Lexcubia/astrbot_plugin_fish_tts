@@ -5,9 +5,9 @@
 """
 
 import asyncio
+import contextlib
 import http.client
 import json
-import socket
 import time
 import urllib.error
 import urllib.request
@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 DEFAULT_BASE = "https://api.fish.audio"
-_USER_AGENT = "astrbot_plugin_fish_tts/3.2"  # 有些 CDN 会拦截默认的 Python-urllib
+_USER_AGENT = "astrbot_plugin_fish_tts/3.4"  # 有些 CDN 会拦截默认的 Python-urllib
 _FORMATS = ("mp3", "wav", "opus")
 _LATENCIES = ("normal", "balanced", "low")
 _FILE_PREFIX = "fish_tts_"
@@ -154,7 +154,7 @@ class FishTTS:
                 if not exc.retryable:
                     raise
                 last = exc
-            except (urllib.error.URLError, socket.timeout, ConnectionError, http.client.HTTPException, OSError) as exc:
+            except (OSError, http.client.HTTPException) as exc:  # URLError、超时、连接错误都是 OSError
                 last = FishError(f"网络错误：{exc}", retryable=True)
             if attempt + 1 < attempts:
                 await asyncio.sleep(0.5)
@@ -183,12 +183,8 @@ class FishTTS:
         if now - self._last_clean < _CLEAN_EVERY:
             return
         self._last_clean = now
-        try:
+        with contextlib.suppress(OSError):
             for item in self.out_dir.glob(f"{_FILE_PREFIX}*"):
-                try:
+                with contextlib.suppress(OSError):
                     if now - item.stat().st_mtime > _KEEP_SECONDS:
                         item.unlink()
-                except OSError:
-                    pass
-        except OSError:
-            pass
