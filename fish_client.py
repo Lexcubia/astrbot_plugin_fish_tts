@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 DEFAULT_BASE = "https://api.fish.audio"
-_USER_AGENT = "astrbot_plugin_fish_tts/3.4"  # 有些 CDN 会拦截默认的 Python-urllib
+_USER_AGENT = "astrbot_plugin_fish_tts/3.5"  # 有些 CDN 会拦截默认的 Python-urllib
 _FORMATS = ("mp3", "wav", "opus")
 _LATENCIES = ("normal", "balanced", "low")
 _FILE_PREFIX = "fish_tts_"

@@ -40,6 +40,24 @@
         "default": true,
         "hint": "关闭后指令回复等其他文本也会参与判断。"
       },
+      "llm_speak_tool": {
+        "description": "LLM 自然开口工具（fish_speak）",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后大模型可调用工具 fish_speak，用 Fish Audio 主动发语音。适合短句口语；与下方「发送前自动转语音」可同时开：工具已发过的相同内容本轮不会再自动转一遍。"
+      },
+      "inject_speak_prompt": {
+        "description": "自动给大模型加开口说明",
+        "type": "bool",
+        "default": true,
+        "hint": "仅在开启「LLM 自然开口工具」时生效：把使用说明追加到系统提示词末尾（固定文本，便于提示词缓存）。"
+      },
+      "speak_prompt": {
+        "description": "自然开口说明（可按人设改写）",
+        "type": "string",
+        "default": "【语音开口】你可以用工具 fish_speak 把要说的话合成语音发出去。适合短句、口语化回复；长文、代码、带链接或需要 @ 某人时请直接用文字回复，不要调用该工具。调用后不要再把同一段话用文字重复发一遍。需要语气时，可在句首加情绪标签，例如 [happy]、[whispering]、[laughing]。",
+        "hint": "告诉大模型何时调用 fish_speak。不想自动注入就关掉上一选项，再把这段贴进人设。"
+      },
       "skip_platforms": {
         "description": "跳过的平台名",
         "type": "list",

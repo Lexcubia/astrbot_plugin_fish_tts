@@ -92,6 +92,13 @@ _NOTE_QUOTE_TEXT = "（系统补充：用户这条消息引用的是你之前发
 # ---------- Fish Audio（v3.0） ----------
 _BACKENDS = ("fish", "astrbot")
 _DEFAULT_MODEL = "s2.1-pro"
+_DEFAULT_SPEAK_PROMPT = (
+    "【语音开口】你可以用工具 fish_speak 把要说的话合成语音发出去。"
+    "适合短句、口语化回复；长文、代码、带链接或需要 @ 某人时请直接用文字回复，不要调用该工具。"
+    "调用后不要再把同一段话用文字重复发一遍。"
+    "需要语气时，可在句首加情绪标签，例如 [happy]、[whispering]、[laughing]。"
+)
+
 _DEFAULT_EMOTION_PROMPT = (
     "【语音情绪标签】你的回复可能会被转成语音。想表达语气时，可以在句子开头加一个方括号情绪标签，"
     "例如：[happy] [sad] [angry] [excited] [surprised] [nervous] [calm] [curious] [sarcastic] "
@@ -153,6 +160,9 @@ class Settings:
     max_chars: int
     min_chars: int
     prob: float
+    llm_speak_tool: bool  # 是否注册 fish_speak，让大模型主动开口
+    inject_speak_prompt: bool
+    speak_prompt: str
     filter_url: bool
     url_action: str
     skip_if_code: bool
@@ -393,6 +403,8 @@ class FishTTSPlugin(Star):
     v3.1 起设置按分组显示，展示名改为「Fish TTS优化」；v3.2 起插件标识改为 astrbot_plugin_fish_tts。
     v3.3 起带「音色库」：用指令保存多个音色 ID、随时切换；语音上下文改用临时内容块注入。
     v3.4 起音色带备注，插件页面里可以管理音色、试听；要求 AstrBot 4.26.0 及以上。
+    v3.5 起提供 LLM 工具 fish_speak：大模型可主动调用，用 Fish Audio 自然开口说话
+    （不依赖发送前钩子，可绕过「工具直发消息跳过装饰」与流式跳过钩子的限制）。
     """
 
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -527,6 +539,9 @@ class FishTTSPlugin(Star):
             max_chars=_as_int(b.get("max_chars"), 80),
             min_chars=_as_int(b.get("min_chars"), 1),
             prob=_as_float(b.get("trigger_probability"), 1.0, lo=0.0, hi=1.0),
+            llm_speak_tool=_as_bool(b.get("llm_speak_tool"), True),
+            inject_speak_prompt=_as_bool(b.get("inject_speak_prompt"), True),
+            speak_prompt=_as_str(b.get("speak_prompt"), _DEFAULT_SPEAK_PROMPT),
             filter_url=_as_bool(r.get("filter_url"), True),
             url_action=_as_str(r.get("url_action"), "append_links"),
             skip_if_code=_as_bool(r.get("skip_if_code"), True),
@@ -595,6 +610,58 @@ class FishTTSPlugin(Star):
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"[fish_tts] TTS 合成失败，保持文字: {exc}")
             return None
+
+    # ---------- LLM 自然开口：工具 ----------
+    @filter.llm_tool(name="fish_speak")
+    async def fish_speak(self, event: AstrMessageEvent, message: str = ""):
+        """用 Fish Audio 把要讲的话合成语音并发送。短句、口语化回复时调用；长文、代码、链接请直接文字回复。
+
+        Args:
+            message(string): 要朗读的话，可在句首加 [happy] [whispering] 等情绪标签
+        """
+        cfg = self._settings()
+        if not cfg.enabled:
+            return "Fish TTS 插件已关闭，请用文字回复。"
+        if not cfg.llm_speak_tool:
+            return "fish_speak 工具未启用，请用文字回复或打开插件设置里的「LLM 自然开口工具」。"
+        if event.get_platform_name() in cfg.skip_platforms:
+            return "当前平台已跳过语音，请用文字回复。"
+
+        text = (message or "").strip()
+        if not text:
+            return "没有可朗读的内容：请传入 message。"
+
+        # 复用自动管道的过滤 / 长度判断，避免工具路径与自动路径规则不一致
+        fake_chain = [Comp.Plain(text=text, convert=False)]
+        plan = self._decide(fake_chain, cfg)
+        if plan is None:
+            return (
+                "这段内容不适合转语音（太长、含链接/代码/@、或过滤后无可读文字）。"
+                "请直接用文字回复，不要再调用 fish_speak。"
+            )
+
+        path = await self._synthesize(event, plan.spoken, cfg)
+        if not path:
+            return "语音合成失败，请改用文字回复。"
+
+        try:
+            voice = Comp.Record.fromFileSystem(path)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[fish_tts] fish_speak 构造语音失败: {exc}")
+            return "语音消息构造失败，请改用文字回复。"
+
+        try:
+            await event.send(event.chain_result([voice]))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[fish_tts] fish_speak 发送失败: {exc}")
+            return f"语音发送失败：{exc}"
+
+        self._mark_voiced(event, plan.plain)
+        self._remember(event, plan.plain, cfg)
+        tags = emotion.count(plan.spoken, cfg.emotion) if cfg.emotion is not None else 0
+        extra = f"，含 {tags} 个情绪标签" if tags else ""
+        logger.info(f"[fish_tts] fish_speak {len(plan.plain)} 字，已发送语音{extra}")
+        return "已用语音发出。不要再把同一段话用文字重复发送。"
 
     # ---------- 音色库指令 ----------
     @filter.command_group("fish音色")
@@ -816,6 +883,15 @@ class FishTTSPlugin(Star):
             event.set_extra(_STATE_KEY, state)
         return state
 
+    def _mark_voiced(self, event: AstrMessageEvent, plain: str) -> None:
+        """把已开口的文本记入本轮去重表（自动管道与 fish_speak 工具共用）。"""
+        key = _NON_WORD.sub("", plain).lower()
+        if not key:
+            return
+        voiced = self._voiced_texts(event)
+        if key not in voiced:
+            voiced.append(key)
+
     @staticmethod
     def _drop_duplicate(event: AstrMessageEvent, result) -> None:
         """丢掉重复回复里的文字。表情图片等其他内容保留，没有内容可发时整条不发。"""
@@ -1036,6 +1112,11 @@ class FishTTSPlugin(Star):
             return
         if event.get_platform_name() in cfg.skip_platforms:
             return
+        if cfg.llm_speak_tool and cfg.inject_speak_prompt and cfg.speak_prompt.strip():
+            try:
+                _append_system(req, cfg.speak_prompt)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"[fish_tts] 追加自然开口提示词失败（已忽略）: {exc}")
         if cfg.emotion is not None and cfg.inject_emotion_prompt:
             try:  # 固定文本追加在系统提示词末尾，不影响提示词缓存
                 _append_system(req, cfg.emotion_prompt)
